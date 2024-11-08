@@ -1,0 +1,8 @@
+.env
+secrets
+data
+config/traefik2/*
+!config/traefik2/rules
+config/transmission/*
+!config/transmission/settings.json
+wg0.conf

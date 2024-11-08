@@ -1,0 +1,436 @@
+---
+
+#################################### NETWORKS
+networks:
+  default:
+    driver: bridge
+  main_net:
+    name: main_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.66.0/24
+  socket_proxy:
+    name: socket_proxy
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.129.0/24
+
+#################################### SECRETS
+secrets:
+  cloudflare_api_token: 
+    file: "./secrets/cloudflare_api_token"
+
+#################################### EXTENSION FIELDS
+# Helps eliminate repetition of sections
+# More Info on how to use this: https://github.com/htpcBeginner/docker-traefik/pull/228
+
+# Common environment values
+x-environment: &x-environment
+  TZ: $TZ
+  PUID: $PUID
+  PGID: $PGID
+
+# Keys common to some of the dependent services/apps
+x-common-keys-apps: &common-keys-apps
+  networks:
+    - main_net
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+
+###################################################### SERVICES  
+services:
+###################################################### CORE
+  socket-proxy:
+    container_name: socket-proxy
+    image: tecnativa/docker-socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks:
+      socket_proxy:
+        ipv4_address: 192.168.129.254 # You can specify a static IP
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    env_file: 
+      - .socketproxy.env
+  
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    # command: --run-once # will run once and stop
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      socket_proxy:
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+    ## ignore updating containers only with `com.centurylinklabs.watchtower.enable=false` 
+      - WATCHTOWER_LABEL_ENABLE=false 
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LOG_LEVEL=info
+      - TZ=$TZ
+      - WATCHTOWER_SCHEDULE=22 22 * * * # at 22:22 every day
+      - WATCHTOWER_NOTIFICATIONS=shoutrrr
+      - WATCHTOWER_NOTIFICATION_TITLE_TAG=$HOSTNAME
+      - WATCHTOWER_NOTIFICATION_URL=$PUSHOVER_URL
+
+
+  # Traefik 2 - Reverse Proxy
+  # Touch (create empty files) traefik.log and acme/acme.json. Set acme.json permissions to 600.
+  # mkdir -p $CONFIGDIR/traefik2/acme && touch $CONFIGDIR/traefik2/acme/acme.json && chmod 600 $CONFIGDIR/traefik2/acme/acme.json && touch $CONFIGDIR/traefik2/traefik.log
+  # 
+  traefik:
+    container_name: "traefik"
+    security_opt:
+    - no-new-privileges:true
+    restart: always
+    image: "traefik:latest"
+    command:
+      - --global.checkNewVersion=true
+      - --global.sendAnonymousUsage=false
+      - --entryPoints.web.address=:80
+      - --entryPoints.websecure.address=:443
+      - --api=true
+      - --api.dashboard=true
+      - --log=true
+      - --log.level=WARN
+      - --accessLog=true
+      - --accessLog.filePath=/traefik.log
+      - --accessLog.bufferingSize=100000 # Configuring a buffer of X lines
+      - --accessLog.filters.statusCodes=400-499,500-599 # filter on not found and errors
+      ## Providers Docker / Socket Proxy
+      - --providers.docker=true
+      - --providers.docker.network=main_net
+      - --providers.docker.endpoint=tcp://socket-proxy:2375
+      # Automatically set Host rule for services
+      # - --providers.docker.defaultrule=Host(`{{ index .Labels "com.docker.compose.service" }}.$DOMAINNAME`)
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.swarmMode=false
+      - --providers.file.directory=/rules
+      - --providers.file.watch=true
+      ## TLS Options for security (A+)
+      - --entrypoints.websecure.http.tls.options=tls-opts@file
+      # Add dns-cloudflare as default for all services. Enables the use of TLS on all services
+      - --entrypoints.websecure.http.tls.certresolver=dns-cloudflare
+      - --entrypoints.websecure.http.tls.domains[0].main=$DOMAINNAME
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.$DOMAINNAME
+      ## DNS Challenge settings
+      # - --certificatesResolvers.dns-cloudflare.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory # LetsEncrypt Staging Server - uncomment when testing
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge=true
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.provider=cloudflare
+      - --certificatesResolvers.dns-cloudflare.acme.email=$CERT_POSTMASTER_MAIL 
+      - --certificatesResolvers.dns-cloudflare.acme.storage=/acme/acme.json
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.resolvers=1.1.1.1:53,1.0.0.1:53
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.delayBeforeCheck=10
+    networks:
+      main_net:
+        ipv4_address: 192.168.66.254 # You can specify a static IP
+      socket_proxy: 
+    #healthcheck:
+    #  test: ["CMD", "traefik", "healthcheck", "--ping"]
+    #  interval: 5s
+    #  retries: 3
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      # - /var/run/docker.sock:/var/run/docker.sock:ro # Use Docker Socket Proxy instead for improved security
+      - $CONFIGDIR/traefik2/rules:/rules
+      - $CONFIGDIR/traefik2/acme:/acme
+      - $CONFIGDIR/traefik2/traefik.log:/traefik.log
+    environment:
+      - TZ=$TZ
+      - CLOUDFLARE_DNS_API_TOKEN_FILE=/run/secrets/cloudflare_api_token 
+    secrets:
+      - cloudflare_api_token
+    labels:
+      - traefik.enable=true
+      # HTTP-to-HTTPS Redirect
+      - "traefik.http.routers.http-catchall.entrypoints=web,websecure"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+       ## DASHBOARD
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.$DOMAINNAME`)"
+      - "traefik.http.routers.traefik.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.traefik.service=api@internal"
+
+  homer:
+    <<: *common-keys-apps
+    container_name: homer
+    image: b4bz/homer:latest
+    restart: unless-stopped
+    #build: .
+    volumes:
+      - $CONFIGDIR/homer/assets/:/www/assets
+    # ports:
+    #   - 8080:8080
+    environment:
+      - TZ=$TZ
+      - INIT_ASSETS=1 # default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homer-rtr.entrypoints=websecure"
+      - "traefik.http.routers.homer-rtr.rule=Host(`home.$DOMAINNAME`)"
+      - "traefik.http.routers.homer-rtr.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.homer-rtr.service=homer-svc"
+      - "traefik.http.services.homer-svc.loadbalancer.server.port=8080"
+
+
+###################################################### SERVICES
+  jellyfin:
+    <<: *common-keys-apps
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    volumes:
+      - $DATADIR/jellyfin/config:/config # local dirs for transcodes and metadata (large ~2GB)
+      - $DATADIR/jellyfin/cache:/cache # local cache
+      - $STORAGEDIR:/data # Media Library containing movies, series, etc
+    restart: 'unless-stopped'
+    # Optional - alternative address used for autodiscovery
+    # ports:
+    #   - 8096:8096
+    group_add:
+      - "109" # Host "render" host group id 
+      - "44" # Host "video" host group id 
+    devices:
+      # - /dev/dri/renderD128:/dev/dri/renderD128
+    environment:
+      - TZ=$TZ
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.jellyfin-rtr.entrypoints=websecure"
+      - "traefik.http.routers.jellyfin-rtr.rule=Host(`jellyfin.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.jellyfin-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.jellyfin-rtr.service=jellyfin-svc"
+      - "traefik.http.services.jellyfin-svc.loadbalancer.server.port=8096"
+
+
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    <<: *common-keys-apps
+    environment:
+        - LOG_LEVEL=debug
+        - TZ=$TZ
+    # ports:
+    #     - 5055:5055
+    volumes:
+        - $DATADIR/jellyseerr:/app/config
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.jellyseerr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.jellyseerr-rtr.rule=Host(`jellyseerr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.jellyseerr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.jellyseerr-rtr.service=jellyseerr-svc"
+      - "traefik.http.services.jellyseerr-svc.loadbalancer.server.port=5055"
+
+
+
+######################################## ARR Apps
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    <<: *common-keys-apps
+    environment:
+      <<: *x-environment
+    volumes:
+      - $DATADIR/sonarr:/config  # configuration and logs
+      - $STORAGEDIR:/data   # media files
+    # ports:
+    #   - 8989:8989
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.sonarr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.sonarr-rtr.rule=Host(`sonarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.sonarr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.sonarr-rtr.service=sonarr-svc"
+      - "traefik.http.services.sonarr-svc.loadbalancer.server.port=8989"
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    <<: *common-keys-apps
+    environment:
+      <<: *x-environment
+    volumes:
+      - $DATADIR/radarr:/config  # configuration and logs
+      - $STORAGEDIR:/data   # media files
+    # ports:
+    #   - 7878:7878
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.radarr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.radarr-rtr.rule=Host(`radarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.radarr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.radarr-rtr.service=radarr-svc"
+      - "traefik.http.services.radarr-svc.loadbalancer.server.port=7878"
+  
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    <<: *common-keys-apps
+    environment:
+      <<: *x-environment
+    # ports:
+    #   - 9696:9696
+    volumes:
+      - $DATADIR/prowlarr:/config  # configuration and logs
+      - $STORAGEDIR:/data   # media files
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.prowlarr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.prowlarr-rtr.rule=Host(`prowlarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.prowlarr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.prowlarr-rtr.service=prowlarr-svc"
+      - "traefik.http.services.prowlarr-svc.loadbalancer.server.port=9696"
+
+  readarr:
+    image: lscr.io/linuxserver/readarr:nightly
+    container_name: readarr
+    <<: *common-keys-apps
+    environment:
+      <<: *x-environment
+    # ports:
+    #   - 8787:8787
+    volumes:
+      - $DATADIR/readarr:/config  # configuration and logs
+      - $STORAGEDIR:/data   # media files
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.readarr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.readarr-rtr.rule=Host(`readarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.readarr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.readarr-rtr.service=readarr-svc"
+      - "traefik.http.services.readarr-svc.loadbalancer.server.port=8787"
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    <<: *common-keys-apps
+    environment:
+      <<: *x-environment
+    # ports:
+    #   - 8686:8686
+    volumes:
+      - $DATADIR/lidarr:/config  # configuration and logs
+      - $STORAGEDIR:/data   # media files
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.lidarr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.lidarr-rtr.rule=Host(`lidarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.lidarr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.lidarr-rtr.service=lidarr-svc"
+      - "traefik.http.services.lidarr-svc.loadbalancer.server.port=8686"
+
+
+  flaresolverr:
+    # DockerHub mirror flaresolverr/flaresolverr:latest
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    <<: *common-keys-apps
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_HTML=${LOG_HTML:-false}
+      - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-none}
+      - TZ=Europe/Paris
+    # ports:
+    #   - "${PORT:-8191}:8191"
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.flaresolverr-rtr.entrypoints=websecure"
+      - "traefik.http.routers.flaresolverr-rtr.rule=Host(`flaresolverr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.flaresolverr-rtr.middlewares=chain-no-rate-limit-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.flaresolverr-rtr.service=flaresolverr-svc"
+      - "traefik.http.services.flaresolverr-svc.loadbalancer.server.port=8191"
+
+
+
+###################################################### TUNNEL AND DL
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:version-v1.0.20210914
+    container_name: wireguard
+    <<: *common-keys-apps
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      <<: *x-environment
+    ports:
+      - "9091:9091/tcp"
+    volumes:
+      - ./wg0.conf:/config/wg_confs/wg0.conf
+      - /lib/modules:/lib/modules
+    labels:
+      ## Disable watchtower automatic updates
+      - com.centurylinklabs.watchtower.enable=false
+      ## Traefik
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.transmit-rtr.entrypoints=websecure"
+      - "traefik.http.routers.transmit-rtr.rule=Host(`transmit.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.transmit-rtr.middlewares=chain-no-rate-limit-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.transmit-rtr.service=transmit-svc"
+      - "traefik.http.services.transmit-svc.loadbalancer.server.port=9091"
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    network_mode: "service:wireguard"
+    container_name: transmission
+    depends_on:
+      - wireguard
+    environment:
+      - PUID=$PUID
+      - PGID=$PGID
+      - TZ=$TZ
+      # - TRANSMISSION_WEB_HOME=/transmissionic/
+      - PEERPORT=$PEERPORT
+      - CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - $CONFIGDIR/transmission:/config
+      - $STORAGEDIR:/data
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    restart: unless-stopped
+
