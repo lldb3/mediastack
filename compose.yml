@@ -384,43 +384,60 @@ services:
 
 
 ###################################################### TUNNEL AND DL
-  wireguard:
-    image: lscr.io/linuxserver/wireguard:version-v1.0.20210914
-    container_name: wireguard
-    <<: *common-keys-apps
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv4.conf.all.src_valid_mark=1
-    environment:
-      <<: *x-environment
+    devices:
+      - /dev/net/tun:/dev/net/tun
     ports:
-      - "9091:9091/tcp"
+      - "9091:9091/tcp"  # transmission
+      - "8888:8888/tcp"  # gluetun built-in HTTP proxy (optional)
+      - "8388:8388/tcp"  # gluetun built-in Socks5 proxy (optional)
     volumes:
-      - ./wg0.conf:/config/wg_confs/wg0.conf
-      - /lib/modules:/lib/modules
+      - $CONFIGDIR/gluetun:/gluetun
+    environment:
+      # VPN service provider: protonvpn, windscribe, surfshark, vyprvpn, ivpn, nordvpn, pia, custom
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      # VPN service account credentials
+      - VPN_TYPE=${VPN_TYPE}  # wireguard or openvpn
+      # For PIA (Private Internet Access)
+      - OPENVPN_USER=${OPENVPN_USER}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      - SERVER_REGIONS=${SERVER_REGIONS}
+      # For NordVPN (uncomment and use these instead)
+      # - NORDVPN_REGION=$NORDVPN_REGION
+      # - NORDVPN_USERNAME=$NORDVPN_USERNAME
+      # - NORDVPN_PASSWORD=$NORDVPN_PASSWORD
+      - TZ=$TZ
+      # Optional: Set to on to killswitch the connection if the VPN goes down
+      - FIREWALL=on
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.66.0/24
+      # Keep connection alive
+      - HEALTH_CHECK_ENABLED=true
+      - HEALTH_TARGET_ADDRESS=cloudflare.com:443
+      - DOT=on
+      - DOT_PROVIDERS=quad9
+      - DOT_IPV6=off
+      - BLOCK_MALICIOUS=off
+      - BLOCK_SURVEILLANCE=on
+      - BLOCK_ADS=on
+
+    networks:
+      main_net:
+        ipv4_address: 192.168.66.240
+    restart: unless-stopped
     labels:
       ## Disable watchtower automatic updates
       - com.centurylinklabs.watchtower.enable=false
-      ## Traefik
-      - "traefik.enable=true"
-      ## HTTP Routers
-      - "traefik.http.routers.transmit-rtr.entrypoints=websecure"
-      - "traefik.http.routers.transmit-rtr.rule=Host(`transmit.$DOMAINNAME`)"
-      ## Middlewares
-      - "traefik.http.routers.transmit-rtr.middlewares=chain-no-rate-limit-no-auth@file"
-      ## HTTP Services
-      - "traefik.http.routers.transmit-rtr.service=transmit-svc"
-      - "traefik.http.services.transmit-svc.loadbalancer.server.port=9091"
 
   transmission:
     image: lscr.io/linuxserver/transmission:latest
-    network_mode: "service:wireguard"
+    network_mode: "service:gluetun"
     container_name: transmission
     depends_on:
-      - wireguard
+      - gluetun
     environment:
       - PUID=$PUID
       - PGID=$PGID
@@ -433,4 +450,14 @@ services:
       - $STORAGEDIR:/data
       - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.transmit-rtr.entrypoints=websecure"
+      - "traefik.http.routers.transmit-rtr.rule=Host(`transmit.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.transmit-rtr.middlewares=chain-no-rate-limit-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.transmit-rtr.service=transmit-svc"
+      - "traefik.http.services.transmit-svc.loadbalancer.server.port=9091"
 
